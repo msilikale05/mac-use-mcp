@@ -34,6 +34,10 @@ import {
   accessibilityToolDefinitions,
   accessibilityToolHandlers,
 } from "./tools/accessibility.js";
+import {
+  focusedScreenshotToolDefinitions,
+  focusedScreenshotToolHandlers,
+} from "./tools/screenshot-focused.js";
 
 const require = createRequire(import.meta.url);
 const { version } = require("../package.json") as { version: string };
@@ -52,6 +56,7 @@ const allToolDefinitions = [
   ...clipboardToolDefinitions,
   ...menuToolDefinitions,
   ...accessibilityToolDefinitions,
+  ...focusedScreenshotToolDefinitions,
 ];
 
 /** Unified handler map — tool name to async handler function. */
@@ -68,6 +73,7 @@ const allToolHandlers: Record<
   ...clipboardToolHandlers,
   ...menuToolHandlers,
   ...accessibilityToolHandlers,
+  ...focusedScreenshotToolHandlers,
 };
 
 const server = new Server(
