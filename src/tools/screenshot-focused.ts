@@ -16,7 +16,31 @@ import type { Tool, CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
 const MIN_MAX_DIMENSION = 256;
 const MAX_MAX_DIMENSION = 4096;
-const DEFAULT_SAVE_DIR = join(homedir(), "Desktop", "screenshots");
+
+/** Base directory for all project screenshot folders. */
+const SCREENSHOTS_BASE = join(homedir(), "Desktop", "screenshots");
+
+/**
+ * Get the project-specific screenshot directory.
+ *
+ * Uses the current working directory name as the project name.
+ * For example, if Claude Code is running in /Users/me/Projects/flood-research,
+ * screenshots go to ~/Desktop/screenshots/flood-research/
+ *
+ * This keeps screenshots organized per project automatically.
+ */
+function getProjectScreenshotDir(): string {
+  const cwd = process.cwd();
+  const projectName = cwd.split("/").pop() || "default";
+  return join(SCREENSHOTS_BASE, projectName);
+}
+
+/** Auto-generate a timestamped filename for screenshots. */
+function autoFilename(prefix: string, format: string): string {
+  const now = new Date();
+  const ts = now.toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
+  return `${prefix}_${ts}.${format}`;
+}
 
 // -- Schemas -----------------------------------------------------------------
 
@@ -44,7 +68,13 @@ const ScreenshotFocusedSchema = z.object({
     .max(1000)
     .optional()
     .describe(
-      "Optional file path to save the screenshot to disk (e.g. '/Users/me/Desktop/screenshots/step_01.png'). If omitted, only returns base64.",
+      "Optional file path to save the screenshot to disk. If omitted, auto-saves to ~/Desktop/screenshots/<project-name>/ with a timestamped filename.",
+    ),
+  auto_save: z
+    .boolean()
+    .default(true)
+    .describe(
+      "When true (default), automatically saves to the project screenshot folder (~/Desktop/screenshots/<project-name>/). Set to false to only return base64 without saving.",
     ),
 });
 
@@ -103,13 +133,14 @@ const SaveScreenshotSchema = z.object({
   save_dir: z
     .string()
     .max(1000)
-    .default(DEFAULT_SAVE_DIR)
-    .describe(`Directory to save screenshots. Defaults to ${DEFAULT_SAVE_DIR}.`),
+    .optional()
+    .describe("Directory to save screenshots. Defaults to ~/Desktop/screenshots/<project-name>/."),
   filename: z
     .string()
     .max(500)
+    .optional()
     .describe(
-      "Filename for the screenshot (e.g. 'step_01_open_file_menu.png'). Extension determines format.",
+      "Filename for the screenshot (e.g. 'step_01_open_file_menu.png'). If omitted, auto-generates a timestamped name.",
     ),
   max_dimension: z
     .number()
@@ -143,6 +174,35 @@ const ScreenshotAppSchema = z.object({
     .describe("Delay in seconds before capturing (useful for menus/popups)."),
 });
 
+const SetProjectSchema = z.object({
+  project_name: z
+    .string()
+    .max(200)
+    .optional()
+    .describe(
+      "Override the project name for screenshot folders. If omitted, resets to auto-detect from the current working directory.",
+    ),
+  base_dir: z
+    .string()
+    .max(1000)
+    .optional()
+    .describe(
+      "Override the base directory for screenshots. Defaults to ~/Desktop/screenshots/.",
+    ),
+});
+
+// -- Project state (overridable per session) ----------------------------------
+
+let _projectNameOverride: string | null = null;
+let _baseDirOverride: string | null = null;
+
+/** Get the active screenshot directory, respecting overrides. */
+function getActiveScreenshotDir(): string {
+  const base = _baseDirOverride || SCREENSHOTS_BASE;
+  const project = _projectNameOverride || process.cwd().split("/").pop() || "default";
+  return join(base, project);
+}
+
 // -- Tool definitions --------------------------------------------------------
 
 export const focusedScreenshotToolDefinitions: Tool[] = [
@@ -173,6 +233,20 @@ export const focusedScreenshotToolDefinitions: Tool[] = [
       "Take a screenshot using a third-party macOS screenshot app (CleanShot X, Shottr) or the built-in screencapture command. Useful when you need features like window shadows, rounded corners, or specific capture modes not available in the default tool.",
     inputSchema: zodToToolInputSchema(ScreenshotAppSchema),
     annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  {
+    name: "set_screenshot_project",
+    description:
+      "Set the project name and/or base directory for organizing screenshots. Screenshots are auto-saved to ~/Desktop/screenshots/<project-name>/. By default, the project name is detected from the current working directory. Use this tool to override it for the session.",
+    inputSchema: zodToToolInputSchema(SetProjectSchema),
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  },
+  {
+    name: "get_screenshot_info",
+    description:
+      "Show the current screenshot settings: project name, save directory, and number of screenshots already taken in this project folder.",
+    inputSchema: zodToToolInputSchema(z.object({})),
+    annotations: { readOnlyHint: true, destructiveHint: false },
   },
 ];
 
@@ -388,8 +462,15 @@ async function handleScreenshotFocused(
 
     const mimeType = parsed.format === "jpeg" ? "image/jpeg" : "image/png";
 
-    if (parsed.save_path) {
-      await saveBase64ToFile(result.base64, parsed.save_path);
+    // Determine save path: explicit > auto-save to project dir > none
+    let savePath = parsed.save_path;
+    if (!savePath && parsed.auto_save) {
+      const dir = getActiveScreenshotDir();
+      savePath = join(dir, autoFilename("screenshot", parsed.format));
+    }
+
+    if (savePath) {
+      await saveBase64ToFile(result.base64, savePath);
     }
 
     return {
@@ -397,7 +478,7 @@ async function handleScreenshotFocused(
         { type: "image" as const, data: result.base64, mimeType },
         {
           type: "text" as const,
-          text: `Captured window: "${title}" (${result.width}x${result.height})${parsed.save_path ? `\nSaved to: ${parsed.save_path}` : ""}`,
+          text: `Captured window: "${title}" (${result.width}x${result.height})${savePath ? `\nSaved to: ${savePath}` : ""}`,
         },
       ],
     };
@@ -472,9 +553,11 @@ async function handleSaveScreenshot(
 ): Promise<CallToolResult> {
   const parsed = SaveScreenshotSchema.parse(args);
 
-  const ext = parsed.filename.split(".").pop()?.toLowerCase();
+  const saveDir = parsed.save_dir || getActiveScreenshotDir();
+  const filename = parsed.filename || autoFilename("screenshot", "png");
+  const ext = filename.split(".").pop()?.toLowerCase();
   const format = ext === "jpeg" || ext === "jpg" ? "jpeg" : "png";
-  const filePath = join(parsed.save_dir, parsed.filename);
+  const filePath = join(saveDir, filename);
 
   const doCapture = async () => {
     let captureOpts: Parameters<typeof captureScreen>[0];
@@ -638,6 +721,76 @@ end tell`);
   }
 }
 
+async function handleSetProject(
+  args: Record<string, unknown>,
+): Promise<CallToolResult> {
+  const parsed = SetProjectSchema.parse(args);
+
+  _projectNameOverride = parsed.project_name || null;
+  _baseDirOverride = parsed.base_dir || null;
+
+  const activeDir = getActiveScreenshotDir();
+
+  // Create the directory now so it's ready
+  await mkdir(activeDir, { recursive: true });
+
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(
+          {
+            success: true,
+            project_name: _projectNameOverride || `(auto: ${process.cwd().split("/").pop()})`,
+            screenshot_dir: activeDir,
+          },
+          null,
+          2,
+        ),
+      },
+    ],
+  };
+}
+
+async function handleGetScreenshotInfo(
+  _args: Record<string, unknown>,
+): Promise<CallToolResult> {
+  const activeDir = getActiveScreenshotDir();
+  const projectName = _projectNameOverride || process.cwd().split("/").pop() || "default";
+
+  // Count existing screenshots in the project folder
+  let fileCount = 0;
+  try {
+    const { readdir } = await import("node:fs/promises");
+    const files = await readdir(activeDir);
+    fileCount = files.filter(
+      (f) => f.endsWith(".png") || f.endsWith(".jpeg") || f.endsWith(".jpg"),
+    ).length;
+  } catch {
+    // Directory doesn't exist yet
+  }
+
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify(
+          {
+            project_name: projectName,
+            auto_detected: !_projectNameOverride,
+            working_directory: process.cwd(),
+            screenshot_dir: activeDir,
+            base_dir: _baseDirOverride || SCREENSHOTS_BASE,
+            screenshots_taken: fileCount,
+          },
+          null,
+          2,
+        ),
+      },
+    ],
+  };
+}
+
 // -- Dispatcher --------------------------------------------------------------
 
 export const focusedScreenshotToolHandlers: Record<
@@ -648,4 +801,6 @@ export const focusedScreenshotToolHandlers: Record<
   screenshot_element: (args) => enqueue(() => handleScreenshotElement(args)),
   save_screenshot: (args) => enqueue(() => handleSaveScreenshot(args)),
   screenshot_with_app: (args) => enqueue(() => handleScreenshotWithApp(args)),
+  set_screenshot_project: (args) => enqueue(() => handleSetProject(args)),
+  get_screenshot_info: (args) => enqueue(() => handleGetScreenshotInfo(args)),
 };
