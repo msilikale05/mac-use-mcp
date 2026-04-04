@@ -21,6 +21,13 @@ const DEFAULT_SAVE_DIR = join(homedir(), "Desktop", "screenshots");
 // -- Schemas -----------------------------------------------------------------
 
 const ScreenshotFocusedSchema = z.object({
+  app: z
+    .string()
+    .max(1000)
+    .optional()
+    .describe(
+      "Application to screenshot (e.g. 'QGIS', 'Safari'). The app will be focused for the screenshot then focus returns to terminal. If omitted, captures whatever is currently focused.",
+    ),
   max_dimension: z
     .number()
     .int()
@@ -77,6 +84,13 @@ const ScreenshotElementSchema = z.object({
 });
 
 const SaveScreenshotSchema = z.object({
+  app: z
+    .string()
+    .max(1000)
+    .optional()
+    .describe(
+      "Application to screenshot. It will be focused, captured, then focus returns to terminal. If omitted with mode 'focused', captures whatever is currently focused.",
+    ),
   mode: z
     .enum(["full", "focused", "window"])
     .default("focused")
@@ -135,21 +149,21 @@ export const focusedScreenshotToolDefinitions: Tool[] = [
   {
     name: "screenshot_focused",
     description:
-      "Capture a screenshot of ONLY the currently focused/frontmost window. No need to specify a window title — it automatically detects the active window. Ideal for step-by-step documentation. Optionally save to a file path.",
+      "Capture a screenshot of a specific app's window. Specify the app name and it will: (1) focus the app, (2) capture its window, (3) return focus to the terminal so you can see progress. If no app is specified, captures whatever is currently focused. Ideal for step-by-step documentation.",
     inputSchema: zodToToolInputSchema(ScreenshotFocusedSchema),
     annotations: { readOnlyHint: true, destructiveHint: false },
   },
   {
     name: "screenshot_element",
     description:
-      "Capture a screenshot of a specific UI element (menu bar, toolbar, dialog, sheet, popover, or focused element) in an application. Uses the macOS Accessibility API to find the element bounds, then captures just that region. Perfect for documenting specific parts of an interface.",
+      "Capture a screenshot of a specific UI element (menu bar, toolbar, dialog, sheet, popover, or focused element) in an application. Focuses the app, captures the element region, then returns focus to the terminal. Uses the macOS Accessibility API to find element bounds.",
     inputSchema: zodToToolInputSchema(ScreenshotElementSchema),
     annotations: { readOnlyHint: true, destructiveHint: false },
   },
   {
     name: "save_screenshot",
     description:
-      "Capture and save a screenshot to disk with a descriptive filename. Ideal for building step-by-step tutorial images. Captures the focused window by default. Creates the save directory if it doesn't exist.",
+      "Capture and save a screenshot to disk with a descriptive filename. Specify an app to focus it, capture, then return to terminal. Ideal for building step-by-step tutorial images. Creates the save directory if it doesn't exist.",
     inputSchema: zodToToolInputSchema(SaveScreenshotSchema),
     annotations: { readOnlyHint: false, destructiveHint: false },
   },
@@ -163,6 +177,54 @@ export const focusedScreenshotToolDefinitions: Tool[] = [
 ];
 
 // -- Helpers -----------------------------------------------------------------
+
+/** Get the frontmost application name via AppleScript. */
+async function getFrontmostApp(): Promise<string> {
+  const script = `
+tell application "System Events"
+  return name of first application process whose frontmost is true
+end tell`;
+  const result = await runAppleScript(script);
+  return result.trim();
+}
+
+/** Focus an application and wait for it to come to front. */
+async function focusApp(appName: string): Promise<void> {
+  const safeApp = appName.replace(/"/g, '\\"');
+  await runAppleScript(`
+tell application "${safeApp}" to activate
+delay 0.5`);
+}
+
+/**
+ * Focus-capture-return pattern:
+ * 1. Remember the current frontmost app (terminal/Warp)
+ * 2. Focus the target app
+ * 3. Run the capture callback
+ * 4. Return focus to the original app
+ *
+ * This ensures the target app is only in focus during the screenshot,
+ * then the terminal comes back so you can see progress.
+ */
+async function focusAndCapture<T>(
+  targetApp: string,
+  captureFn: () => Promise<T>,
+): Promise<T> {
+  // 1. Remember where we are (terminal/Warp)
+  const previousApp = await getFrontmostApp();
+
+  // 2. Focus the target app
+  await focusApp(targetApp);
+
+  try {
+    // 3. Take the screenshot
+    const result = await captureFn();
+    return result;
+  } finally {
+    // 4. Always return to the previous app (terminal/Warp)
+    await focusApp(previousApp);
+  }
+}
 
 /** Get the frontmost window title and app via AppleScript. */
 async function getFocusedWindowInfo(): Promise<{
@@ -182,6 +244,21 @@ end tell`;
   const result = await runAppleScript(script);
   const parts = result.split("|||");
   return { app: parts[0] || "Unknown", title: parts[1] || "" };
+}
+
+/** Get the window title for a specific app (without changing focus). */
+async function getWindowTitleForApp(appName: string): Promise<string> {
+  const safeApp = appName.replace(/"/g, '\\"');
+  const script = `
+tell application "System Events"
+  try
+    return name of front window of process "${safeApp}"
+  on error
+    return ""
+  end try
+end tell`;
+  const result = await runAppleScript(script);
+  return result.trim();
 }
 
 /** Get bounds of a UI element via Accessibility API. */
@@ -286,42 +363,51 @@ async function handleScreenshotFocused(
 ): Promise<CallToolResult> {
   const parsed = ScreenshotFocusedSchema.parse(args);
 
-  const { title } = await getFocusedWindowInfo();
-  if (!title) {
+  const doCapture = async () => {
+    // Get the window title of the now-focused app
+    const { title } = await getFocusedWindowInfo();
+    if (!title) {
+      throw new Error("No focused window found. Make sure the application has a visible window.");
+    }
+
+    const result = await captureScreen({
+      mode: "window",
+      windowTitle: title,
+      maxDimension: parsed.max_dimension,
+      format: parsed.format,
+    });
+
+    return { result, title };
+  };
+
+  try {
+    // If an app is specified, use focus-capture-return pattern
+    const { result, title } = parsed.app
+      ? await focusAndCapture(parsed.app, doCapture)
+      : await doCapture();
+
+    const mimeType = parsed.format === "jpeg" ? "image/jpeg" : "image/png";
+
+    if (parsed.save_path) {
+      await saveBase64ToFile(result.base64, parsed.save_path);
+    }
+
     return {
       content: [
+        { type: "image" as const, data: result.base64, mimeType },
         {
           type: "text" as const,
-          text: "No focused window found. Make sure an application window is in the foreground.",
+          text: `Captured window: "${title}" (${result.width}x${result.height})${parsed.save_path ? `\nSaved to: ${parsed.save_path}` : ""}`,
         },
       ],
+    };
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      content: [{ type: "text" as const, text: `Screenshot failed: ${message}` }],
       isError: true,
     };
   }
-
-  const result = await captureScreen({
-    mode: "window",
-    windowTitle: title,
-    maxDimension: parsed.max_dimension,
-    format: parsed.format,
-  });
-
-  const mimeType = parsed.format === "jpeg" ? "image/jpeg" : "image/png";
-
-  // Optionally save to disk
-  if (parsed.save_path) {
-    await saveBase64ToFile(result.base64, parsed.save_path);
-  }
-
-  const content: CallToolResult["content"] = [
-    { type: "image" as const, data: result.base64, mimeType },
-    {
-      type: "text" as const,
-      text: `Captured focused window: "${title}" (${result.width}x${result.height})${parsed.save_path ? `\nSaved to: ${parsed.save_path}` : ""}`,
-    },
-  ];
-
-  return { content };
 }
 
 async function handleScreenshotElement(
@@ -329,50 +415,56 @@ async function handleScreenshotElement(
 ): Promise<CallToolResult> {
   const parsed = ScreenshotElementSchema.parse(args);
 
-  const bounds = await getElementBounds(parsed.app, parsed.element);
-  if (!bounds) {
+  const doCapture = async () => {
+    const bounds = await getElementBounds(parsed.app, parsed.element);
+    if (!bounds) {
+      throw new Error(
+        `Could not find ${parsed.element} in ${parsed.app}. Make sure the app is running and the element is visible.`,
+      );
+    }
+
+    const p = parsed.padding;
+    const region = {
+      x: bounds.x - p,
+      y: bounds.y - p,
+      w: bounds.w + p * 2,
+      h: bounds.h + p * 2,
+    };
+
+    return captureScreen({
+      mode: "region",
+      region,
+      maxDimension: parsed.max_dimension,
+      format: parsed.format,
+    });
+  };
+
+  try {
+    // Always use focus-capture-return for element screenshots
+    const result = await focusAndCapture(parsed.app, doCapture);
+
+    const mimeType = parsed.format === "jpeg" ? "image/jpeg" : "image/png";
+
+    if (parsed.save_path) {
+      await saveBase64ToFile(result.base64, parsed.save_path);
+    }
+
     return {
       content: [
+        { type: "image" as const, data: result.base64, mimeType },
         {
           type: "text" as const,
-          text: `Could not find ${parsed.element} in ${parsed.app}. Make sure the app is running and the element is visible.`,
+          text: `Captured ${parsed.element} of ${parsed.app} (${result.width}x${result.height})${parsed.save_path ? `\nSaved to: ${parsed.save_path}` : ""}`,
         },
       ],
+    };
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      content: [{ type: "text" as const, text: `Screenshot failed: ${message}` }],
       isError: true,
     };
   }
-
-  // Add padding
-  const p = parsed.padding;
-  const region = {
-    x: bounds.x - p,
-    y: bounds.y - p,
-    w: bounds.w + p * 2,
-    h: bounds.h + p * 2,
-  };
-
-  const result = await captureScreen({
-    mode: "region",
-    region,
-    maxDimension: parsed.max_dimension,
-    format: parsed.format,
-  });
-
-  const mimeType = parsed.format === "jpeg" ? "image/jpeg" : "image/png";
-
-  if (parsed.save_path) {
-    await saveBase64ToFile(result.base64, parsed.save_path);
-  }
-
-  return {
-    content: [
-      { type: "image" as const, data: result.base64, mimeType },
-      {
-        type: "text" as const,
-        text: `Captured ${parsed.element} of ${parsed.app} (${result.width}x${result.height})${parsed.save_path ? `\nSaved to: ${parsed.save_path}` : ""}`,
-      },
-    ],
-  };
 }
 
 async function handleSaveScreenshot(
@@ -384,62 +476,67 @@ async function handleSaveScreenshot(
   const format = ext === "jpeg" || ext === "jpg" ? "jpeg" : "png";
   const filePath = join(parsed.save_dir, parsed.filename);
 
-  let captureOpts: Parameters<typeof captureScreen>[0];
+  const doCapture = async () => {
+    let captureOpts: Parameters<typeof captureScreen>[0];
 
-  if (parsed.mode === "focused") {
-    const { title } = await getFocusedWindowInfo();
-    if (!title) {
-      return {
-        content: [{ type: "text" as const, text: "No focused window found." }],
-        isError: true,
+    if (parsed.mode === "focused") {
+      const { title } = await getFocusedWindowInfo();
+      if (!title) {
+        throw new Error("No focused window found.");
+      }
+      captureOpts = {
+        mode: "window",
+        windowTitle: title,
+        maxDimension: parsed.max_dimension,
+        format,
+      };
+    } else if (parsed.mode === "window") {
+      if (!parsed.window_title) {
+        throw new Error("window_title is required when mode is 'window'.");
+      }
+      captureOpts = {
+        mode: "window",
+        windowTitle: parsed.window_title,
+        maxDimension: parsed.max_dimension,
+        format,
+      };
+    } else {
+      captureOpts = {
+        mode: "full",
+        maxDimension: parsed.max_dimension,
+        format,
       };
     }
-    captureOpts = {
-      mode: "window",
-      windowTitle: title,
-      maxDimension: parsed.max_dimension,
-      format,
+
+    return captureScreen(captureOpts);
+  };
+
+  try {
+    // If an app is specified, use focus-capture-return pattern
+    const result = parsed.app
+      ? await focusAndCapture(parsed.app, doCapture)
+      : await doCapture();
+
+    await saveBase64ToFile(result.base64, filePath);
+
+    const mimeType = format === "jpeg" ? "image/jpeg" : "image/png";
+
+    return {
+      content: [
+        { type: "image" as const, data: result.base64, mimeType },
+        {
+          type: "text" as const,
+          text: `Screenshot saved: ${filePath} (${result.width}x${result.height})`,
+        },
+      ],
     };
-  } else if (parsed.mode === "window") {
-    if (!parsed.window_title) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: "window_title is required when mode is 'window'.",
-          },
-        ],
-        isError: true,
-      };
-    }
-    captureOpts = {
-      mode: "window",
-      windowTitle: parsed.window_title,
-      maxDimension: parsed.max_dimension,
-      format,
-    };
-  } else {
-    captureOpts = {
-      mode: "full",
-      maxDimension: parsed.max_dimension,
-      format,
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      content: [{ type: "text" as const, text: `Screenshot failed: ${message}` }],
+      isError: true,
     };
   }
-
-  const result = await captureScreen(captureOpts);
-  await saveBase64ToFile(result.base64, filePath);
-
-  const mimeType = format === "jpeg" ? "image/jpeg" : "image/png";
-
-  return {
-    content: [
-      { type: "image" as const, data: result.base64, mimeType },
-      {
-        type: "text" as const,
-        text: `Screenshot saved: ${filePath} (${result.width}x${result.height})`,
-      },
-    ],
-  };
 }
 
 async function handleScreenshotWithApp(
