@@ -262,11 +262,51 @@ end tell`;
   return result.trim();
 }
 
+/**
+ * Resolve a user-friendly app name (e.g. "QGIS") to the actual process name
+ * that macOS knows (e.g. "QGIS-master-2a28365" or "QGIS-4").
+ * Uses fuzzy matching via System Events.
+ */
+async function resolveProcessName(appName: string): Promise<string> {
+  const safeApp = appName.replace(/"/g, '\\"').toLowerCase();
+  const script = `
+tell application "System Events"
+  set matchedApp to ""
+  repeat with proc in (every application process whose background only is false)
+    set procName to name of proc
+    if procName is "${safeApp}" then
+      return procName
+    end if
+    if (procName as text) starts with "${safeApp}" then
+      set matchedApp to procName as text
+    end if
+  end repeat
+  if matchedApp is not "" then
+    return matchedApp
+  end if
+  -- Try case-insensitive contains as last resort
+  repeat with proc in (every application process whose background only is false)
+    set procName to name of proc as text
+    considering case
+      if procName contains "${appName}" then
+        return procName
+      end if
+    end considering
+  end repeat
+  return "${appName}"
+end tell`;
+  const result = await runAppleScript(script);
+  return result.trim();
+}
+
 /** Focus an application and wait for it to come to front. */
 async function focusApp(appName: string): Promise<void> {
-  const safeApp = appName.replace(/"/g, '\\"');
+  const processName = await resolveProcessName(appName);
+  const safeApp = processName.replace(/"/g, '\\"');
   await runAppleScript(`
-tell application "${safeApp}" to activate
+tell application "System Events"
+  set frontmost of process "${safeApp}" to true
+end tell
 delay 0.5`);
 }
 
@@ -322,7 +362,8 @@ end tell`;
 
 /** Get the window title for a specific app (without changing focus). */
 async function getWindowTitleForApp(appName: string): Promise<string> {
-  const safeApp = appName.replace(/"/g, '\\"');
+  const processName = await resolveProcessName(appName);
+  const safeApp = processName.replace(/"/g, '\\"');
   const script = `
 tell application "System Events"
   try
@@ -340,14 +381,14 @@ async function getElementBounds(
   app: string,
   element: string,
 ): Promise<{ x: number; y: number; w: number; h: number } | null> {
-  let role: string;
+  const processName = await resolveProcessName(app);
   let searchScript: string;
 
   switch (element) {
     case "menu_bar":
       searchScript = `
 tell application "System Events"
-  tell process "${app}"
+  tell process "${processName}"
     set mb to menu bar 1
     set pos to position of mb
     set sz to size of mb
@@ -358,7 +399,7 @@ end tell`;
     case "toolbar":
       searchScript = `
 tell application "System Events"
-  tell process "${app}"
+  tell process "${processName}"
     set tb to toolbar 1 of front window
     set pos to position of tb
     set sz to size of tb
@@ -370,7 +411,7 @@ end tell`;
     case "sheet":
       searchScript = `
 tell application "System Events"
-  tell process "${app}"
+  tell process "${processName}"
     set dlg to front window
     -- Try to find a sheet first, then fall back to the window itself
     try
@@ -385,7 +426,7 @@ end tell`;
     case "popover":
       searchScript = `
 tell application "System Events"
-  tell process "${app}"
+  tell process "${processName}"
     set pop to pop over 1 of front window
     set pos to position of pop
     set sz to size of pop
@@ -396,7 +437,7 @@ end tell`;
     case "focused_element":
       searchScript = `
 tell application "System Events"
-  tell process "${app}"
+  tell process "${processName}"
     set fe to focused UI element of front window
     set pos to position of fe
     set sz to size of fe
